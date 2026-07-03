@@ -1,42 +1,67 @@
 """
-Vercel serverless demo for Nigerian misinformation detection.
+Nigerian misinformation *verification* service (Vercel serverless, stdlib-only).
 
-Pure Python standard library only — no numpy / scikit-learn / torch at request
-time. It loads the exported TF-IDF + Logistic Regression model (`model.json`,
-~19 KB, colocated) and classifies text as misinformation vs. credible, exactly
-reproducing scikit-learn's output (verified in src/export_web_model.py).
+Given free text, a news URL, or a social-media link, it:
 
-GET  /              -> HTML demo page
-POST /api/predict   -> {"text": "..."} -> {"label", "probability", ...}
+  1. extracts the claim (fetches + parses the page for links),
+  2. retrieves live evidence from established fact-checkers via the Google
+     Fact Check Tools API (ClaimReview: Africa Check, Dubawa, PolitiFact, ...),
+  3. asks the Anthropic API (Claude) for a reasoned assessment,
+  4. always runs the local TF-IDF model as an offline fallback signal,
+
+then combines them into one verdict with clickable sources.
+
+No third-party packages: URL fetching and both APIs go through urllib. Secrets
+come from environment variables set in the Vercel dashboard:
+
+    GOOGLE_FACTCHECK_API_KEY   free key from Google Cloud (Fact Check Tools API)
+    ANTHROPIC_API_KEY          key from console.anthropic.com
+    ANTHROPIC_MODEL            optional, default "claude-haiku-4-5-20251001"
+
+Everything degrades gracefully: with no keys it behaves as the offline ML demo.
+
+Routes:  GET /   -> HTML UI
+         POST /api/verify   {"input": "..."}  -> full hybrid verdict
+         POST /api/predict  {"text": "..."}   -> ML-only signal (legacy)
 """
 
+import ipaddress
 import json
 import math
 import os
 import re
+import socket
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler
 
+# --------------------------------------------------------------------------- #
+#  Local TF-IDF model (offline fallback)                                       #
+# --------------------------------------------------------------------------- #
 TOKEN_RE = re.compile(r"\b\w\w+\b")
 URL_RE = re.compile(r"https?://\S+|www\.\S+")
 HANDLE_RE = re.compile(r"@\w+")
 NON_ALNUM_RE = re.compile(r"[^a-z0-9\s'#]")
 MULTISPACE_RE = re.compile(r"\s+")
+IS_URL_RE = re.compile(r"^\s*https?://", re.I)
 
+MIN_MATCHED_TERMS = 3
+UNCERTAIN_BAND = 0.10
 _MODEL = None
 
 
 def load_model():
     global _MODEL
     if _MODEL is None:
-        path = os.path.join(os.path.dirname(__file__), "model.json")
-        with open(path, encoding="utf-8") as fh:
+        with open(os.path.join(os.path.dirname(__file__), "model.json"),
+                  encoding="utf-8") as fh:
             _MODEL = json.load(fh)
     return _MODEL
 
 
 def clean(text):
-    text = str(text).lower()
-    text = URL_RE.sub(" ", text)
+    text = URL_RE.sub(" ", str(text).lower())
     text = HANDLE_RE.sub(" ", text)
     text = NON_ALNUM_RE.sub(" ", text)
     return MULTISPACE_RE.sub(" ", text).strip()
@@ -50,152 +75,441 @@ def ngrams(text, ngram_max):
     return grams
 
 
-# The model is trained on a small (~130-example) curated corpus, so it reasons
-# from learned surface vocabulary, not real-world knowledge. To avoid confidently
-# mislabelling text it has never "seen", the demo ABSTAINS ("uncertain") when it
-# recognises too few terms or the decision is too close to the boundary.
-MIN_MATCHED_TERMS = 3      # need at least this many known n-grams to commit
-UNCERTAIN_BAND = 0.10      # |p - 0.5| below this -> uncertain
-
-
-def predict(text):
+def ml_predict(text):
     model = load_model()
-    vocab = model["vocab"]           # ngram -> [idf, coef]
-    ngram_max = model.get("ngram_max", 2)
-
+    vocab = model["vocab"]
     counts = {}
-    for g in ngrams(text, ngram_max):
+    for g in ngrams(text, model.get("ngram_max", 2)):
         if g in vocab:
             counts[g] = counts.get(g, 0) + 1
-
     vec = {g: (1.0 + math.log(c)) * vocab[g][0] for g, c in counts.items()}
     norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
-
-    contributions = []
+    contribs = []
     score = model["intercept"]
     for g, v in vec.items():
-        contrib = (v / norm) * vocab[g][1]
-        score += contrib
-        contributions.append((g, contrib))
-
-    prob = 1.0 / (1.0 + math.exp(-score))          # raw model P(misinformation)
-    raw_label = 1 if prob >= 0.5 else 0
-    contributions.sort(key=lambda kv: abs(kv[1]), reverse=True)
-
+        c = (v / norm) * vocab[g][1]
+        score += c
+        contribs.append((g, c))
+    prob = 1.0 / (1.0 + math.exp(-score))
+    raw = 1 if prob >= 0.5 else 0
+    contribs.sort(key=lambda kv: abs(kv[1]), reverse=True)
     matched = len(vec)
     uncertain = matched < MIN_MATCHED_TERMS or abs(prob - 0.5) < UNCERTAIN_BAND
-    if uncertain:
-        verdict = "uncertain"
-    else:
-        verdict = model["labels"][str(raw_label)]
-
     return {
-        "verdict": verdict,                        # credible | misinformation | uncertain
+        "verdict": "uncertain" if uncertain else model["labels"][str(raw)],
         "uncertain": uncertain,
-        "label": model["labels"][str(raw_label)],  # raw model call (ignoring abstention)
-        "label_id": raw_label,
         "probability_misinformation": round(prob, 4),
-        "confidence": round(prob if raw_label == 1 else 1 - prob, 4),
         "matched_terms": matched,
         "top_signals": [
             {"ngram": g, "weight": round(c, 4),
              "towards": "misinformation" if c > 0 else "credible"}
-            for g, c in contributions[:6]
-        ],
-        "note": ("Too little recognised vocabulary to judge confidently — this "
-                 "demo only knows terms from its small training corpus."
-                 if uncertain else
-                 "Classified from learned vocabulary; not a real-world fact-check."),
+            for g, c in contribs[:6]],
     }
 
 
+# --------------------------------------------------------------------------- #
+#  URL fetching + claim extraction                                             #
+# --------------------------------------------------------------------------- #
+class _Extract(HTMLParser):
+    SKIP = {"script", "style", "noscript", "svg", "head"}
+    KEEP = {"p", "h1", "h2", "h3", "article", "li", "blockquote"}
+
+    def __init__(self):
+        super().__init__()
+        self.title = ""
+        self.og = {}
+        self._skip = 0
+        self._keep = 0
+        self._in_title = False
+        self.chunks = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self._skip += 1
+        if tag == "title":
+            self._in_title = True
+        if tag in self.KEEP:
+            self._keep += 1
+        if tag == "meta":
+            a = dict(attrs)
+            key = (a.get("property") or a.get("name") or "").lower()
+            if key in ("og:title", "og:description", "twitter:title",
+                       "twitter:description", "description") and a.get("content"):
+                self.og.setdefault(key, a["content"].strip())
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self._skip:
+            self._skip -= 1
+        if tag == "title":
+            self._in_title = False
+        if tag in self.KEEP and self._keep:
+            self._keep -= 1
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        if self._in_title:
+            self.title += data
+        elif self._keep:
+            t = data.strip()
+            if len(t) > 1:
+                self.chunks.append(t)
+
+
+def _url_is_safe(url):
+    try:
+        p = urllib.parse.urlparse(url)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return False
+        for fam, _, _, _, sa in socket.getaddrinfo(p.hostname, None):
+            ip = ipaddress.ip_address(sa[0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def fetch_claim(url):
+    """Fetch a URL and return (claim_text, context_text, meta) or raise."""
+    if not _url_is_safe(url):
+        raise ValueError("URL is not reachable or not allowed.")
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; NG-MisinfoVerify/1.0)",
+        "Accept": "text/html,application/xhtml+xml"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        ctype = resp.headers.get("Content-Type", "")
+        raw = resp.read(1_500_000)
+    if "html" not in ctype and "xml" not in ctype and not raw.lstrip().startswith(b"<"):
+        text = raw.decode("utf-8", "ignore")
+        return text[:400], text[:2000], {"final_url": url}
+    charset = "utf-8"
+    m = re.search(r"charset=([\w-]+)", ctype)
+    if m:
+        charset = m.group(1)
+    ex = _Extract()
+    try:
+        ex.feed(raw.decode(charset, "ignore"))
+    except Exception:
+        ex.feed(raw.decode("utf-8", "ignore"))
+    claim = (ex.og.get("og:title") or ex.og.get("twitter:title")
+             or ex.title.strip() or "")
+    desc = (ex.og.get("og:description") or ex.og.get("twitter:description")
+            or ex.og.get("description") or "")
+    body = " ".join(ex.chunks)[:2000]
+    context = (desc + " " + body).strip()[:2000]
+    if not claim:
+        claim = context[:200]
+    return claim.strip()[:400], context, {"final_url": url, "title": ex.title.strip()}
+
+
+# --------------------------------------------------------------------------- #
+#  Evidence source 1: Google Fact Check Tools API                              #
+# --------------------------------------------------------------------------- #
+RATING_MAP = [
+    ("pants on fire", "false"), ("false", "false"), ("incorrect", "false"),
+    ("fake", "false"), ("hoax", "false"), ("no evidence", "false"),
+    ("misleading", "misleading"), ("mixture", "misleading"),
+    ("partly", "misleading"), ("half", "misleading"), ("exaggerat", "misleading"),
+    ("unproven", "misleading"), ("misattributed", "misleading"),
+    ("mostly true", "true"), ("true", "true"), ("correct", "true"),
+    ("accurate", "true"), ("legit", "true"),
+]
+
+
+def normalise_rating(text):
+    t = (text or "").lower()
+    for key, val in RATING_MAP:
+        if key in t:
+            return val
+    return None
+
+
+def google_factcheck(query):
+    key = os.environ.get("GOOGLE_FACTCHECK_API_KEY")
+    if not key or not query.strip():
+        return []
+    params = urllib.parse.urlencode({
+        "query": query[:300], "key": key, "languageCode": "en", "pageSize": 6})
+    url = "https://factchecktools.googleapis.com/v1alpha1/claims:search?" + params
+    try:
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return []
+    out = []
+    for claim in data.get("claims", []):
+        for rev in claim.get("claimReview", []):
+            rating = rev.get("textualRating")
+            out.append({
+                "claim": claim.get("text"),
+                "rating": rating,
+                "normalised": normalise_rating(rating),
+                "publisher": (rev.get("publisher") or {}).get("name"),
+                "url": rev.get("url"),
+                "title": rev.get("title"),
+            })
+    return out
+
+
+# --------------------------------------------------------------------------- #
+#  Evidence source 2: Anthropic (Claude) reasoning                             #
+# --------------------------------------------------------------------------- #
+LLM_PROMPT = """You are a careful, neutral fact-checking assistant with a focus \
+on Nigerian and African context. Assess the CLAIM below.
+
+You have a knowledge cutoff and no live internet access. If the claim depends on \
+recent events, specific figures, or anything you cannot confirm from general \
+knowledge, answer "unverifiable" rather than guessing. Be sceptical of sensational \
+health cures, giveaways, and doctored quotes.
+
+Reply with ONLY a JSON object, no prose, in this exact shape:
+{{"verdict": "true|false|misleading|unverifiable", "confidence": 0.0-1.0, \
+"explanation": "2-3 plain sentences a general reader understands", \
+"reasoning_points": ["short point", "short point"]}}
+
+CLAIM: {claim}
+{context}"""
+
+
+def anthropic_assess(claim, context=""):
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key or not claim.strip():
+        return None
+    model = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+    ctx = f"\nARTICLE CONTEXT: {context[:1200]}" if context else ""
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 600,
+        "messages": [{"role": "user",
+                      "content": LLM_PROMPT.format(claim=claim[:1500], context=ctx)}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body, method="POST",
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            data = json.loads(resp.read())
+        text = "".join(b.get("text", "") for b in data.get("content", []))
+        m = re.search(r"\{.*\}", text, re.S)
+        parsed = json.loads(m.group(0)) if m else {}
+        return {
+            "verdict": parsed.get("verdict", "unverifiable"),
+            "confidence": parsed.get("confidence"),
+            "explanation": parsed.get("explanation", "").strip(),
+            "reasoning_points": parsed.get("reasoning_points", [])[:5],
+            "model": model,
+        }
+    except urllib.error.HTTPError as e:
+        return {"error": f"Anthropic API error {e.code}", "detail": e.read().decode("utf-8", "ignore")[:300]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# --------------------------------------------------------------------------- #
+#  Combine into a single verdict                                               #
+# --------------------------------------------------------------------------- #
+DISPLAY = {"false": ("misinformation", "🚩"), "misleading": ("misleading", "⚠️"),
+           "true": ("credible", "✅"), "unverifiable": ("unverifiable", "🤔"),
+           "uncertain": ("uncertain", "🤔"), "misinformation": ("misinformation", "🚩"),
+           "credible": ("credible", "✅")}
+
+
+def _factcheck_consensus(results):
+    votes = [r["normalised"] for r in results if r["normalised"]]
+    if not votes:
+        return None
+    for v in ("false", "misleading", "true"):   # prioritise a "false" signal
+        if votes.count(v) == max(votes.count(x) for x in set(votes)) and v in votes:
+            return v
+    return votes[0]
+
+
+def verify(user_input):
+    user_input = (user_input or "").strip()
+    is_url = bool(IS_URL_RE.match(user_input))
+    source_url = user_input if is_url else None
+    context = ""
+    fetch_error = None
+
+    if is_url:
+        try:
+            claim, context, _ = fetch_claim(user_input)
+        except Exception as e:
+            claim, fetch_error = user_input, str(e)
+    else:
+        claim = user_input
+
+    factchecks = google_factcheck(claim)
+    llm = anthropic_assess(claim, context)
+    ml = ml_predict(claim)
+
+    # Decide the headline verdict, best evidence first.
+    sources_used = []
+    fc_consensus = _factcheck_consensus(factchecks)
+    if fc_consensus:
+        verdict, basis = fc_consensus, "published fact-checks"
+        confidence = 0.9
+        sources_used.append("Google Fact Check")
+    elif llm and not llm.get("error") and llm.get("verdict"):
+        verdict, basis = llm["verdict"], "AI reasoning (Claude)"
+        confidence = llm.get("confidence") or 0.6
+        sources_used.append("Claude")
+    else:
+        verdict, basis = ml["verdict"], "offline ML model (limited)"
+        confidence = ml["probability_misinformation"] if ml["verdict"] != "uncertain" else None
+        sources_used.append("local ML")
+
+    label, icon = DISPLAY.get(verdict, (verdict, "🤔"))
+    keys_present = {
+        "google_factcheck": bool(os.environ.get("GOOGLE_FACTCHECK_API_KEY")),
+        "anthropic": bool(os.environ.get("ANTHROPIC_API_KEY")),
+    }
+    return {
+        "input_type": "url" if is_url else "text",
+        "source_url": source_url,
+        "claim": claim,
+        "fetch_error": fetch_error,
+        "verdict": verdict,
+        "display_label": label,
+        "icon": icon,
+        "basis": basis,
+        "confidence": confidence,
+        "sources_used": sources_used,
+        "fact_checks": factchecks,
+        "llm": llm,
+        "ml": ml,
+        "keys_present": keys_present,
+    }
+
+
+# --------------------------------------------------------------------------- #
+#  HTML UI                                                                      #
+# --------------------------------------------------------------------------- #
 PAGE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Nigerian Misinformation Detector</title>
+<title>Nigerian Claim & News Verifier</title>
 <style>
 :root{color-scheme:light dark;--bg:#0f1420;--card:#1b2333;--fg:#e8edf6;--mut:#93a1b8;
 --red:#ff5c6c;--green:#31c56d;--amber:#e0a338;--acc:#5b8cff;--bd:#2a3549}
 @media(prefers-color-scheme:light){:root{--bg:#f4f6fb;--card:#fff;--fg:#141a26;
 --mut:#5a667c;--bd:#e2e7f0}}
-*{box-sizing:border-box}body{margin:0;font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+*{box-sizing:border-box}body{margin:0;font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
 background:var(--bg);color:var(--fg);padding:2rem 1rem}
-.wrap{max-width:760px;margin:0 auto}
-h1{font-size:1.7rem;margin:0 0 .3rem}.sub{color:var(--mut);margin:0 0 1.6rem}
-.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:1.3rem;margin-bottom:1.2rem}
-textarea{width:100%;min-height:120px;background:transparent;color:var(--fg);border:1px solid var(--bd);
+.wrap{max-width:780px;margin:0 auto}
+h1{font-size:1.7rem;margin:0 0 .3rem}.sub{color:var(--mut);margin:0 0 1.4rem}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:1.3rem;margin-bottom:1.1rem}
+textarea{width:100%;min-height:96px;background:transparent;color:var(--fg);border:1px solid var(--bd);
 border-radius:10px;padding:.8rem;font:inherit;resize:vertical}
-button{margin-top:.9rem;background:var(--acc);color:#fff;border:0;border-radius:10px;
+button{margin-top:.8rem;background:var(--acc);color:#fff;border:0;border-radius:10px;
 padding:.7rem 1.4rem;font:inherit;font-weight:600;cursor:pointer}
 button:disabled{opacity:.6;cursor:wait}
 .chips{margin:.6rem 0 0;display:flex;flex-wrap:wrap;gap:.4rem}
 .chip{font-size:.82rem;color:var(--mut);border:1px solid var(--bd);border-radius:20px;
 padding:.25rem .7rem;cursor:pointer;background:transparent}
 .result{display:none}
-.verdict{font-size:1.35rem;font-weight:700;display:flex;align-items:center;gap:.5rem}
-.bar{height:12px;border-radius:6px;background:var(--bd);overflow:hidden;margin:.7rem 0}
-.bar>span{display:block;height:100%}
-.meta{color:var(--mut);font-size:.9rem}
-.sig{display:flex;justify-content:space-between;padding:.35rem 0;border-top:1px solid var(--bd);font-size:.92rem}
-.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
-.foot{color:var(--mut);font-size:.82rem;margin-top:1.4rem;text-align:center}
+.verdict{font-size:1.4rem;font-weight:700;display:flex;align-items:center;gap:.5rem}
+.claim{color:var(--mut);font-size:.92rem;margin:.5rem 0 .2rem}
+.basis{font-size:.85rem;color:var(--mut);margin-top:.3rem}
+.sec{margin-top:1rem;border-top:1px solid var(--bd);padding-top:.8rem}
+.sec h3{font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);margin:0 0 .5rem}
+.fc{padding:.5rem 0;border-bottom:1px solid var(--bd)}
+.fc a{color:var(--acc);text-decoration:none}.fc a:hover{text-decoration:underline}
+.pill{display:inline-block;font-size:.72rem;font-weight:700;padding:.1rem .5rem;border-radius:20px;margin-right:.4rem}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9rem}
+.warn{background:rgba(224,163,56,.12);border:1px solid var(--amber);border-radius:10px;
+padding:.6rem .8rem;font-size:.85rem;margin-bottom:1rem}
+.foot{color:var(--mut);font-size:.8rem;margin-top:1.3rem;text-align:center}
+ul{margin:.3rem 0 0 1.1rem;padding:0}
 </style></head><body><div class="wrap">
-<h1>Nigerian Misinformation Detector</h1>
-<p class="sub">TF-IDF + Logistic Regression, trained on a small (~130-example) Nigerian-context
-fact-check corpus. It judges by <b>learned vocabulary</b>, not real-world knowledge,
-and says <b>“uncertain”</b> when it doesn't recognise enough of your text. Educational
-demo — not a verdict on any real claim.</p>
+<h1>Nigerian Claim &amp; News Verifier</h1>
+<p class="sub">Paste a claim, a news article link, or a social-media link. It checks
+established fact-checkers, reasons over the claim, and shows sources. Verdicts are
+guidance, not proof.</p>
+<div id="setup"></div>
 <div class="card">
-<textarea id="t" placeholder="Paste a claim or social-media post, e.g. 'Drinking warm salt water flushes out coronavirus'..."></textarea>
+<textarea id="t" placeholder="Paste a statement, or a link like https://... (news or social post)"></textarea>
 <div class="chips" id="ex"></div>
-<button id="b" onclick="go()">Analyse</button>
+<button id="b" onclick="go()">Verify</button>
 </div>
 <div class="card result" id="r">
 <div class="verdict" id="v"></div>
-<div class="bar"><span id="bar"></span></div>
-<div class="meta" id="m"></div>
-<div id="sigs" style="margin-top:.9rem"></div>
+<div class="basis" id="basis"></div>
+<div class="claim" id="claim"></div>
+<div id="body"></div>
 </div>
-<p class="foot">Model reproduces scikit-learn output exactly (pure-Python inference).
-Part of the "ML Approach to Detecting Misinformation in Nigerian Social Media Content" project.</p>
+<p class="foot">Hybrid verifier: Google Fact Check Tools API + Claude reasoning +
+an offline TF-IDF model. Educational project — always check the linked sources yourself.</p>
 </div>
 <script>
-const EX=["The COVID-19 vaccine contains a 5G microchip to track Nigerians who take it.",
+const EX=["https://www.bbc.com/news",
+"The COVID-19 vaccine contains a 5G microchip to track Nigerians who take it.",
 "INEC introduced the BVAS to verify voters using fingerprints and facial recognition.",
-"Forward this message to 10 people and the government will send you N30,000 palliative.",
-"Malaria is transmitted through the bite of an infected female Anopheles mosquito."];
+"Forward this message to 10 people and the government will send you N30,000 palliative."];
 const ex=document.getElementById('ex');
 EX.forEach(e=>{const c=document.createElement('span');c.className='chip';
-c.textContent=e.length>52?e.slice(0,52)+'…':e;c.onclick=()=>{document.getElementById('t').value=e;go()};ex.appendChild(c)});
+c.textContent=e.length>50?e.slice(0,50)+'…':e;c.onclick=()=>{document.getElementById('t').value=e;go()};ex.appendChild(c)});
+const COL={misinformation:'var(--red)',misleading:'var(--amber)',credible:'var(--green)',
+uncertain:'var(--amber)',unverifiable:'var(--amber)'};
+function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 async function go(){
  const t=document.getElementById('t').value.trim();if(!t)return;
- const b=document.getElementById('b');b.disabled=true;b.textContent='Analysing…';
+ const b=document.getElementById('b');b.disabled=true;b.textContent='Verifying…';
  try{
-  const res=await fetch('/api/predict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});
-  const d=await res.json();
-  const pct=Math.round(d.probability_misinformation*100);
-  const st=d.uncertain?{i:'🤔',c:'var(--amber)',t:'UNCERTAIN'}
-        :d.label_id===1?{i:'🚩',c:'var(--red)',t:'MISINFORMATION'}
-        :{i:'✅',c:'var(--green)',t:'CREDIBLE'};
-  document.getElementById('r').style.display='block';
-  document.getElementById('v').innerHTML=st.i+' <span style=\"color:'+st.c+'\">'+st.t+'</span>';
-  document.getElementById('bar').style.width=pct+'%';
-  document.getElementById('bar').style.background=st.c;
-  document.getElementById('m').innerHTML='P(misinformation) = '+pct+'%  ·  '+
-   d.matched_terms+' known terms matched<br><span style=\"font-size:.85em\">'+d.note+'</span>';
-  let h=d.top_signals.length?'<div class="meta">Top signals</div>':'';
-  d.top_signals.forEach(s=>{h+='<div class="sig"><span class="mono">'+s.ngram+
-   '</span><span style="color:'+(s.weight>0?'var(--red)':'var(--green)')+'">'+
-   (s.weight>0?'+':'')+s.weight+' → '+s.towards+'</span></div>'});
-  document.getElementById('sigs').innerHTML=h;
+  const res=await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input:t})});
+  const d=await res.json();render(d);
  }catch(e){document.getElementById('r').style.display='block';
   document.getElementById('v').textContent='Error: '+e}
- b.disabled=false;b.textContent='Analyse';
+ b.disabled=false;b.textContent='Verify';
+}
+function render(d){
+ document.getElementById('r').style.display='block';
+ const col=COL[d.display_label]||'var(--mut)';
+ document.getElementById('v').innerHTML=d.icon+' <span style="color:'+col+'">'+esc(d.display_label.toUpperCase())+'</span>'+
+   (d.confidence!=null?' <span style="font-size:.85rem;color:var(--mut)">('+Math.round(d.confidence*100)+'% conf.)</span>':'');
+ document.getElementById('basis').textContent='Based on: '+esc(d.basis)+' · sources: '+(d.sources_used||[]).join(', ');
+ document.getElementById('claim').innerHTML=(d.input_type==='url'?'🔗 Extracted claim: ':'')+
+   '“'+esc(d.claim)+'”'+(d.fetch_error?' <span style="color:var(--amber)">(could not fetch link: '+esc(d.fetch_error)+')</span>':'');
+ let h='';
+ // fact-checks
+ if(d.fact_checks&&d.fact_checks.length){
+  h+='<div class="sec"><h3>Published fact-checks</h3>';
+  d.fact_checks.forEach(f=>{const c=COL[({false:'misinformation',misleading:'misleading',true:'credible'})[f.normalised]]||'var(--mut)';
+   h+='<div class="fc"><span class="pill" style="background:'+c+';color:#fff">'+esc(f.rating||'?')+'</span>'+
+      '<a href="'+esc(f.url)+'" target="_blank" rel="noopener">'+esc(f.publisher||f.title||f.url)+'</a>'+
+      (f.claim?'<div class="mono" style="color:var(--mut)">“'+esc(f.claim)+'”</div>':'')+'</div>'});
+  h+='</div>';
+ }
+ // llm
+ if(d.llm&&!d.llm.error&&d.llm.explanation){
+  h+='<div class="sec"><h3>AI assessment (Claude)</h3><div>'+esc(d.llm.explanation)+'</div>';
+  if(d.llm.reasoning_points&&d.llm.reasoning_points.length){h+='<ul>'+d.llm.reasoning_points.map(p=>'<li>'+esc(p)+'</li>').join('')+'</ul>'}
+  h+='</div>';
+ } else if(d.llm&&d.llm.error){h+='<div class="sec"><h3>AI assessment</h3><div style="color:var(--amber)">'+esc(d.llm.error)+'</div></div>'}
+ // ml
+ if(d.ml){h+='<div class="sec"><h3>Offline ML signal</h3><div class="mono">'+esc(d.ml.verdict)+
+   ' · P(misinfo)='+d.ml.probability_misinformation+' · '+d.ml.matched_terms+' known terms</div></div>'}
+ document.getElementById('body').innerHTML=h;
+ // setup hint if no keys
+ const s=document.getElementById('setup');
+ if(d.keys_present&&!(d.keys_present.google_factcheck||d.keys_present.anthropic)){
+  s.innerHTML='<div class="warn">⚙️ Running in <b>offline mode</b>. Add <span class="mono">GOOGLE_FACTCHECK_API_KEY</span> and/or '+
+   '<span class="mono">ANTHROPIC_API_KEY</span> in your Vercel project settings to enable live fact-check retrieval and AI reasoning.</div>';
+ } else {s.innerHTML='';}
 }
 </script></body></html>"""
 
 
+# --------------------------------------------------------------------------- #
+#  HTTP handler                                                                 #
+# --------------------------------------------------------------------------- #
 class handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):  # keep Vercel logs quiet
+        pass
+
     def _send(self, code, body, ctype):
         data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
@@ -204,22 +518,30 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(length) or b"{}")
+
     def do_GET(self):
-        if self.path.rstrip("/") in ("/api/predict",):
+        path = self.path.split("?")[0].rstrip("/")
+        if path in ("/api/verify", "/api/predict"):
             self._send(405, json.dumps({"error": "use POST"}), "application/json")
         else:
             self._send(200, PAGE, "text/html; charset=utf-8")
 
     def do_POST(self):
+        path = self.path.split("?")[0].rstrip("/")
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(length) or b"{}")
-            text = (payload.get("text") or "").strip()
-            if not text:
-                self._send(400, json.dumps({"error": "field 'text' required"}),
-                           "application/json")
-                return
-            result = predict(text)
-            self._send(200, json.dumps(result), "application/json")
+            payload = self._read_json()
+            if path == "/api/predict":
+                text = (payload.get("text") or "").strip()
+                if not text:
+                    return self._send(400, json.dumps({"error": "field 'text' required"}), "application/json")
+                return self._send(200, json.dumps(ml_predict(text)), "application/json")
+            # default: full verification
+            user_input = (payload.get("input") or payload.get("text") or "").strip()
+            if not user_input:
+                return self._send(400, json.dumps({"error": "field 'input' required"}), "application/json")
+            self._send(200, json.dumps(verify(user_input)), "application/json")
         except Exception as exc:  # pragma: no cover
             self._send(500, json.dumps({"error": str(exc)}), "application/json")

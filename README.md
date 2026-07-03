@@ -118,35 +118,57 @@ Confusion matrices for every model are in `results/figures/`.
 
 ---
 
-## 4. Live web demo (Vercel)
+## 4. Live web verifier (Vercel)
 
-A tiny, self-contained web demo lets you paste a claim and see the model's
-verdict, probability and the n-grams driving it:
+The deployed app is a **hybrid verifier**: paste a **claim, a news-article link,
+or a social-media link** and it returns a verdict **with clickable sources**.
 
 ```
-api/index.py     # pure-Python (stdlib only) serverless handler + HTML page
+api/index.py     # pure-Python (stdlib only) serverless handler + HTML UI
 api/model.json   # the TF-IDF + LogReg model exported to ~19 KB of JSON
-vercel.json      # routes / and /api/predict to the function
+vercel.json      # routes /, /api/verify, /api/predict to the function
 ```
 
-The winning **Logistic Regression** pipeline is exported to plain JSON by
-`src/export_web_model.py`, and inference is re-implemented in pure Python — its
-output matches scikit-learn to machine precision (parity check `max |Δp| ≈ 2e-16`).
-This means the serverless function needs **no** numpy / scikit-learn / torch, so
-it deploys within Vercel's size limits and starts instantly. `.vercelignore`
-excludes the training stack from the deployment. The demo is educational and is
-**not** a verdict on any real-world claim.
+For each request the function (running on Vercel, which has open internet):
+
+1. **Extracts the claim** — if the input is a URL it fetches the page and parses
+   the title / OpenGraph / body text (social links: only the public preview is
+   readable). A basic SSRF guard blocks private/loopback addresses.
+2. **Retrieves live evidence** from the **Google Fact Check Tools API** — the
+   ClaimReview database used by Africa Check, Dubawa, PolitiFact and others — and
+   shows each matching fact-check's rating, publisher and link.
+3. **Reasons over the claim** with the **Anthropic API (Claude)**, returning a
+   verdict + plain-language explanation (it answers *unverifiable* rather than
+   guessing on things it can't confirm).
+4. **Falls back** to the offline TF-IDF model when no external evidence is found.
+
+It picks the headline verdict from the strongest evidence available (published
+fact-checks → AI reasoning → offline model) and always shows every signal so you
+can judge for yourself. **Verdicts are guidance, not proof — check the sources.**
+
+### Configuration (Vercel → Project → Settings → Environment Variables)
+
+| Variable | Needed for | How to get it |
+|---|---|---|
+| `GOOGLE_FACTCHECK_API_KEY` | live fact-check retrieval | Google Cloud Console → enable *Fact Check Tools API* → create an API key (free) |
+| `ANTHROPIC_API_KEY` | AI reasoning | [console.anthropic.com](https://console.anthropic.com) → API keys |
+| `ANTHROPIC_MODEL` | *(optional)* override model | defaults to `claude-haiku-4-5-20251001` |
+
+With **no** keys set the app still runs, in **offline mode** (TF-IDF model only)
+and shows a banner explaining how to enable the live sources. Everything is
+stdlib-only — no third-party packages to install, so the function stays tiny and
+cold-starts fast. `.vercelignore` keeps the training stack out of the deployment.
 
 ```
-POST /api/predict   {"text": "..."}  ->  {label, probability_misinformation, top_signals, ...}
+POST /api/verify    {"input": "<text or URL>"}  ->  {verdict, fact_checks[], llm, ml, sources_used, ...}
+POST /api/predict   {"text": "..."}             ->  offline ML signal only (legacy)
 ```
 
 Run it locally:
 
 ```bash
-python -m http.server  # not this — use the handler directly:
 python -c "import sys; sys.path.insert(0,'api'); from http.server import HTTPServer; import index; HTTPServer(('127.0.0.1',8000), index.handler).serve_forever()"
-# then open http://127.0.0.1:8000/
+# then open http://127.0.0.1:8000/  (set the env vars first to enable live sources)
 ```
 
 ---
@@ -169,8 +191,8 @@ python -c "import sys; sys.path.insert(0,'api'); from http.server import HTTPSer
 │   ├── export_web_model.py       # export LogReg -> web/model JSON (+ parity check)
 │   └── scrape.py                 # ClaimReview scraping scaffold (opt-in)
 ├── api/
-│   ├── index.py                  # pure-Python serverless demo (Vercel)
-│   └── model.json                # exported ~19 KB model
+│   ├── index.py                  # hybrid verifier: fact-check API + Claude + ML (Vercel)
+│   └── model.json                # exported ~19 KB offline-fallback model
 ├── vercel.json / .vercelignore   # deploy config (lean, no heavy deps)
 └── results/
     ├── metrics/                  # per-model + combined JSON

@@ -118,7 +118,40 @@ Confusion matrices for every model are in `results/figures/`.
 
 ---
 
-## 4. Repository layout
+## 4. Live web demo (Vercel)
+
+A tiny, self-contained web demo lets you paste a claim and see the model's
+verdict, probability and the n-grams driving it:
+
+```
+api/index.py     # pure-Python (stdlib only) serverless handler + HTML page
+api/model.json   # the TF-IDF + LogReg model exported to ~19 KB of JSON
+vercel.json      # routes / and /api/predict to the function
+```
+
+The winning **Logistic Regression** pipeline is exported to plain JSON by
+`src/export_web_model.py`, and inference is re-implemented in pure Python — its
+output matches scikit-learn to machine precision (parity check `max |Δp| ≈ 2e-16`).
+This means the serverless function needs **no** numpy / scikit-learn / torch, so
+it deploys within Vercel's size limits and starts instantly. `.vercelignore`
+excludes the training stack from the deployment. The demo is educational and is
+**not** a verdict on any real-world claim.
+
+```
+POST /api/predict   {"text": "..."}  ->  {label, probability_misinformation, top_signals, ...}
+```
+
+Run it locally:
+
+```bash
+python -m http.server  # not this — use the handler directly:
+python -c "import sys; sys.path.insert(0,'api'); from http.server import HTTPServer; import index; HTTPServer(('127.0.0.1',8000), index.handler).serve_forever()"
+# then open http://127.0.0.1:8000/
+```
+
+---
+
+## 5. Repository layout
 
 ```
 ├── run.py                        # one-command end-to-end pipeline
@@ -133,14 +166,19 @@ Confusion matrices for every model are in `results/figures/`.
 │   ├── train_transformer.py      # fine-tune pretrained DistilBERT (needs HF hub)
 │   ├── train_transformer_scratch.py  # from-scratch PyTorch transformer
 │   ├── evaluate.py               # metrics, confusion matrices, comparison plot
+│   ├── export_web_model.py       # export LogReg -> web/model JSON (+ parity check)
 │   └── scrape.py                 # ClaimReview scraping scaffold (opt-in)
+├── api/
+│   ├── index.py                  # pure-Python serverless demo (Vercel)
+│   └── model.json                # exported ~19 KB model
+├── vercel.json / .vercelignore   # deploy config (lean, no heavy deps)
 └── results/
     ├── metrics/                  # per-model + combined JSON
     ├── figures/                  # confusion matrices + comparison bar chart
     └── summary_table.txt         # the table above
 ```
 
-## 5. Reproduce
+## 6. Reproduce
 
 ```bash
 pip install -r requirements.txt
@@ -154,7 +192,7 @@ python src/train_transformer.py       # fine-tune DistilBERT (needs huggingface.
 
 All randomness is seeded (`random_state = 42`) so runs are deterministic.
 
-## 6. Limitations & next steps
+## 7. Limitations & next steps
 
 - **Dataset size and provenance.** 131 curated items are enough to demonstrate
   and compare the pipeline, not to ship a production detector. Use `src/scrape.py`

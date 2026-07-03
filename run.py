@@ -109,6 +109,11 @@ def main():
           f"(macro-F1 = {best[1].get('macro_f1'):.3f})")
     print("\nArtifacts written to results/  (metrics/, figures/, summary_table.txt)")
 
+    # Keep the deployed web demo's model in sync with the trained pipeline.
+    banner("STAGE 5 — Export dependency-free model for the web demo")
+    from export_web_model import main as export_web
+    export_web()
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,13 @@
+# The Vercel deployment only needs the pure-Python serverless demo in api/.
+# Exclude the research/training stack so no heavy pip install (torch, sklearn,
+# pandas, matplotlib) runs during the build and the function stays tiny.
+src/
+data/
+results/
+run.py
+requirements.txt
+README.md
+.gitignore
+__pycache__/
+*.joblib
+*.pt

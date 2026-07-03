@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Large / regenerable model checkpoints
+results/models/
+data/processed/
+
+# Keep the curated dataset, metrics and figures under version control.
+!data/raw/

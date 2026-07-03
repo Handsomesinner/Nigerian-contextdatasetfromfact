@@ -1,0 +1,13 @@
+{
+  "Transformer (scratch)": {
+    "accuracy": 0.7778,
+    "precision": 0.8462,
+    "recall": 0.7333,
+    "f1": 0.7857,
+    "macro_f1": 0.7775,
+    "roc_auc": 0.8944,
+    "architecture": "from-scratch transformer encoder",
+    "parameters": 385538,
+    "epochs": 40
+  }
+}

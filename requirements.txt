@@ -1,0 +1,16 @@
+# Core data / classical ML
+numpy
+pandas
+scikit-learn
+matplotlib
+seaborn
+joblib
+
+# Transformer classifier
+torch>=2.0
+transformers>=4.30
+# datasets is optional; the training script works without it
+datasets ; python_version >= "3.8"
+
+# Live scraping scaffold (optional)
+requests

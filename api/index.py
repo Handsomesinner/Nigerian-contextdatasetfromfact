@@ -416,6 +416,12 @@ padding:.25rem .7rem;cursor:pointer;background:transparent}
 .basis{font-size:.85rem;color:var(--mut);margin-top:.3rem}
 .sec{margin-top:1rem;border-top:1px solid var(--bd);padding-top:.8rem}
 .sec h3{font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);margin:0 0 .5rem}
+.ai{margin-top:1.1rem;background:rgba(91,140,255,.09);border:1px solid var(--acc);
+border-radius:12px;padding:1rem 1.1rem}
+.ai h3{color:var(--acc);margin:0 0 .5rem}
+.ai .exp{font-size:1.1rem;line-height:1.6}
+.ai .call{font-size:.85rem;color:var(--mut);margin-top:.5rem}
+.muted{opacity:.62}.muted .mono{font-size:.82rem}
 .fc{padding:.5rem 0;border-bottom:1px solid var(--bd)}
 .fc a{color:var(--acc);text-decoration:none}.fc a:hover{text-decoration:underline}
 .pill{display:inline-block;font-size:.72rem;font-weight:700;padding:.1rem .5rem;border-radius:20px;margin-right:.4rem}
@@ -483,15 +489,26 @@ function render(d){
       (f.claim?'<div class="mono" style="color:var(--mut)">“'+esc(f.claim)+'”</div>':'')+'</div>'});
   h+='</div>';
  }
- // llm
- if(d.llm&&!d.llm.error&&d.llm.explanation){
-  h+='<div class="sec"><h3>AI assessment (Claude)</h3><div>'+esc(d.llm.explanation)+'</div>';
+ // llm — the centrepiece when Claude answered
+ const hasLlm=d.llm&&!d.llm.error&&d.llm.explanation;
+ if(hasLlm){
+  const lc=COL[({true:'credible',false:'misinformation',misleading:'misleading',unverifiable:'unverifiable'})[d.llm.verdict]]||'var(--mut)';
+  h+='<div class="ai"><h3>🧠 AI assessment (Claude)</h3><div class="exp">'+esc(d.llm.explanation)+'</div>';
   if(d.llm.reasoning_points&&d.llm.reasoning_points.length){h+='<ul>'+d.llm.reasoning_points.map(p=>'<li>'+esc(p)+'</li>').join('')+'</ul>'}
-  h+='</div>';
- } else if(d.llm&&d.llm.error){h+='<div class="sec"><h3>AI assessment</h3><div style="color:var(--amber)">'+esc(d.llm.error)+'</div></div>'}
- // ml
- if(d.ml){h+='<div class="sec"><h3>Offline ML signal</h3><div class="mono">'+esc(d.ml.verdict)+
-   ' · P(misinfo)='+d.ml.probability_misinformation+' · '+d.ml.matched_terms+' known terms</div></div>'}
+  h+='<div class="call">Claude\\'s call: <b style="color:'+lc+'">'+esc((d.llm.verdict||'').toUpperCase())+'</b>'+
+     (d.llm.confidence!=null?' · '+Math.round(d.llm.confidence*100)+'% confidence':'')+
+     (d.llm.model?' · '+esc(d.llm.model):'')+'</div></div>';
+ } else if(d.llm&&d.llm.error){
+  h+='<div class="sec"><h3>AI assessment</h3><div style="color:var(--amber)">'+esc(d.llm.error)+
+     '</div><div class="basis">Check that ANTHROPIC_API_KEY (and model access) are set in Vercel.</div></div>';
+ }
+ // ml — primary when nothing else answered, otherwise a muted technical footnote
+ if(d.ml){
+  const mlPrimary=!hasLlm&&!(d.fact_checks&&d.fact_checks.length);
+  h+='<div class="sec'+(mlPrimary?'':' muted')+'"><h3>'+(mlPrimary?'Offline ML signal':'Technical fallback signal (offline model)')+
+   '</h3><div class="mono">'+esc(d.ml.verdict)+' · P(misinfo)='+d.ml.probability_misinformation+
+   ' · '+d.ml.matched_terms+' known terms</div></div>';
+ }
  document.getElementById('body').innerHTML=h;
  // setup hint if no keys
  const s=document.getElementById('setup');

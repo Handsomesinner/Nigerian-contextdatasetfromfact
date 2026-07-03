@@ -25,6 +25,7 @@ Routes:  GET /   -> HTML UI
          POST /api/predict  {"text": "..."}   -> ML-only signal (legacy)
 """
 
+import datetime as _dt
 import ipaddress
 import json
 import math
@@ -257,14 +258,18 @@ def google_factcheck(query):
 #  Evidence source 2: Anthropic (Claude) reasoning                             #
 # --------------------------------------------------------------------------- #
 LLM_PROMPT = """You are a careful, neutral fact-checking assistant with a focus \
-on Nigerian and African context. Assess the CLAIM below.
+on Nigerian and African context. Today's date is {today}. Assess the CLAIM below.
 
-You have a knowledge cutoff and no live internet access. If the claim depends on \
-recent events, specific figures, or anything you cannot confirm from general \
-knowledge, answer "unverifiable" rather than guessing. Be sceptical of sensational \
-health cures, giveaways, and doctored quotes.
+You have a web_search tool. USE IT whenever the claim could depend on recent \
+events, current status, deaths, elections, appointments, prices, or any fact that \
+may have changed after your training cutoff — do not rely on memory for anything \
+time-sensitive. Search for the latest reporting from credible outlets, then judge. \
+Be sceptical of sensational health cures, giveaways, and doctored quotes. If, even \
+after searching, you cannot confirm the claim, answer "unverifiable" rather than \
+guessing.
 
-Reply with ONLY a JSON object, no prose, in this exact shape:
+After any searches, end your reply with ONLY a JSON object on its own, in this \
+exact shape (no extra prose after it):
 {{"verdict": "true|false|misleading|unverifiable", "confidence": 0.0-1.0, \
 "explanation": "2-3 plain sentences a general reader understands", \
 "reasoning_points": ["short point", "short point"]}}
@@ -273,37 +278,72 @@ CLAIM: {claim}
 {context}"""
 
 
+def _anthropic_call(key, model, prompt, use_tools):
+    payload = {
+        "model": model,
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if use_tools:
+        payload["tools"] = [{"type": "web_search_20250305", "name": "web_search",
+                             "max_uses": 5}]
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=json.dumps(payload).encode(),
+        method="POST",
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=55) as resp:
+        return json.loads(resp.read())
+
+
+def _parse_anthropic(data, model, web_search):
+    content = data.get("content", [])
+    text = "".join(b.get("text", "") for b in content if b.get("type") == "text")
+    sources, seen = [], set()
+    for b in content:
+        if b.get("type") == "web_search_tool_result":
+            for r in b.get("content", []):
+                url = r.get("url")
+                if r.get("type") == "web_search_result" and url and url not in seen:
+                    seen.add(url)
+                    sources.append({"title": r.get("title") or url, "url": url})
+    m = re.search(r"\{.*\}", text, re.S)
+    parsed = json.loads(m.group(0)) if m else {}
+    return {
+        "verdict": parsed.get("verdict", "unverifiable"),
+        "confidence": parsed.get("confidence"),
+        "explanation": parsed.get("explanation", "").strip(),
+        "reasoning_points": parsed.get("reasoning_points", [])[:5],
+        "web_sources": sources[:6],
+        "web_search": web_search and bool(sources),
+        "model": model,
+    }
+
+
 def anthropic_assess(claim, context=""):
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key or not claim.strip():
         return None
     model = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
     ctx = f"\nARTICLE CONTEXT: {context[:1200]}" if context else ""
-    body = json.dumps({
-        "model": model,
-        "max_tokens": 600,
-        "messages": [{"role": "user",
-                      "content": LLM_PROMPT.format(claim=claim[:1500], context=ctx)}],
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages", data=body, method="POST",
-        headers={"x-api-key": key, "anthropic-version": "2023-06-01",
-                 "content-type": "application/json"})
+    today = _dt.datetime.utcnow().strftime("%d %B %Y")
+    prompt = LLM_PROMPT.format(today=today, claim=claim[:1500], context=ctx)
+    want_search = os.environ.get("ANTHROPIC_WEB_SEARCH", "1") != "0"
     try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            data = json.loads(resp.read())
-        text = "".join(b.get("text", "") for b in data.get("content", []))
-        m = re.search(r"\{.*\}", text, re.S)
-        parsed = json.loads(m.group(0)) if m else {}
-        return {
-            "verdict": parsed.get("verdict", "unverifiable"),
-            "confidence": parsed.get("confidence"),
-            "explanation": parsed.get("explanation", "").strip(),
-            "reasoning_points": parsed.get("reasoning_points", [])[:5],
-            "model": model,
-        }
+        try:
+            data = _anthropic_call(key, model, prompt, use_tools=want_search)
+            return _parse_anthropic(data, model, web_search=want_search)
+        except urllib.error.HTTPError as e:
+            # e.g. web search not enabled on the account -> retry without tools
+            if want_search and e.code in (400, 403, 404):
+                data = _anthropic_call(key, model, prompt, use_tools=False)
+                out = _parse_anthropic(data, model, web_search=False)
+                out["note"] = "Web search unavailable on this key; answered from model knowledge only."
+                return out
+            raise
     except urllib.error.HTTPError as e:
-        return {"error": f"Anthropic API error {e.code}", "detail": e.read().decode("utf-8", "ignore")[:300]}
+        return {"error": f"Anthropic API error {e.code}",
+                "detail": e.read().decode("utf-8", "ignore")[:300]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -354,9 +394,11 @@ def verify(user_input):
         confidence = 0.9
         sources_used.append("Google Fact Check")
     elif llm and not llm.get("error") and llm.get("verdict"):
-        verdict, basis = llm["verdict"], "AI reasoning (Claude)"
-        confidence = llm.get("confidence") or 0.6
-        sources_used.append("Claude")
+        searched = llm.get("web_search")
+        verdict = llm["verdict"]
+        basis = "Claude + live web search" if searched else "AI reasoning (Claude)"
+        confidence = llm.get("confidence") or (0.7 if searched else 0.6)
+        sources_used.append("Claude web search" if searched else "Claude")
     else:
         verdict, basis = ml["verdict"], "offline ML model (limited)"
         confidence = ml["probability_misinformation"] if ml["verdict"] != "uncertain" else None
@@ -433,8 +475,8 @@ ul{margin:.3rem 0 0 1.1rem;padding:0}
 </style></head><body><div class="wrap">
 <h1>Nigerian Claim &amp; News Verifier</h1>
 <p class="sub">Paste a claim, a news article link, or a social-media link. It checks
-established fact-checkers, reasons over the claim, and shows sources. Verdicts are
-guidance, not proof.</p>
+established fact-checkers, searches the live web, reasons over the claim, and shows
+its sources. Verdicts are guidance, not proof.</p>
 <div id="setup"></div>
 <div class="card">
 <textarea id="t" placeholder="Paste a statement, or a link like https://... (news or social post)"></textarea>
@@ -447,7 +489,7 @@ guidance, not proof.</p>
 <div class="claim" id="claim"></div>
 <div id="body"></div>
 </div>
-<p class="foot">Hybrid verifier: Google Fact Check Tools API + Claude reasoning +
+<p class="foot">Hybrid verifier: Google Fact Check Tools API + Claude with live web search +
 an offline TF-IDF model. Educational project — always check the linked sources yourself.</p>
 </div>
 <script>
@@ -493,8 +535,14 @@ function render(d){
  const hasLlm=d.llm&&!d.llm.error&&d.llm.explanation;
  if(hasLlm){
   const lc=COL[({true:'credible',false:'misinformation',misleading:'misleading',unverifiable:'unverifiable'})[d.llm.verdict]]||'var(--mut)';
-  h+='<div class="ai"><h3>🧠 AI assessment (Claude)</h3><div class="exp">'+esc(d.llm.explanation)+'</div>';
+  const badge=d.llm.web_search?' <span class="pill" style="background:var(--acc);color:#fff">🔎 live web</span>':'';
+  h+='<div class="ai"><h3>🧠 AI assessment (Claude)'+badge+'</h3><div class="exp">'+esc(d.llm.explanation)+'</div>';
   if(d.llm.reasoning_points&&d.llm.reasoning_points.length){h+='<ul>'+d.llm.reasoning_points.map(p=>'<li>'+esc(p)+'</li>').join('')+'</ul>'}
+  if(d.llm.web_sources&&d.llm.web_sources.length){
+    h+='<div class="call">Sources Claude checked:</div><div>'+d.llm.web_sources.map(s=>
+      '<div class="fc"><a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc(s.title)+'</a></div>').join('')+'</div>';
+  }
+  if(d.llm.note){h+='<div class="call">⚠️ '+esc(d.llm.note)+'</div>';}
   h+='<div class="call">Claude\\'s call: <b style="color:'+lc+'">'+esc((d.llm.verdict||'').toUpperCase())+'</b>'+
      (d.llm.confidence!=null?' · '+Math.round(d.llm.confidence*100)+'% confidence':'')+
      (d.llm.model?' · '+esc(d.llm.model):'')+'</div></div>';

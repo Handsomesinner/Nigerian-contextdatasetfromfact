@@ -137,9 +137,11 @@ For each request the function (running on Vercel, which has open internet):
 2. **Retrieves live evidence** from the **Google Fact Check Tools API** — the
    ClaimReview database used by Africa Check, Dubawa, PolitiFact and others — and
    shows each matching fact-check's rating, publisher and link.
-3. **Reasons over the claim** with the **Anthropic API (Claude)**, returning a
-   verdict + plain-language explanation (it answers *unverifiable* rather than
-   guessing on things it can't confirm).
+3. **Reasons over the claim** with the **Anthropic API (Claude)**, using Claude's
+   built-in **live web search** so it checks *current* reporting instead of relying
+   on its training cutoff — essential for recent events (deaths, elections, prices).
+   It returns a verdict + explanation + the source links it consulted, and answers
+   *unverifiable* rather than guessing when it still can't confirm.
 4. **Falls back** to the offline TF-IDF model when no external evidence is found.
 
 It picks the headline verdict from the strongest evidence available (published
@@ -151,8 +153,16 @@ can judge for yourself. **Verdicts are guidance, not proof — check the sources
 | Variable | Needed for | How to get it |
 |---|---|---|
 | `GOOGLE_FACTCHECK_API_KEY` | live fact-check retrieval | Google Cloud Console → enable *Fact Check Tools API* → create an API key (free) |
-| `ANTHROPIC_API_KEY` | AI reasoning | [console.anthropic.com](https://console.anthropic.com) → API keys |
+| `ANTHROPIC_API_KEY` | AI reasoning + live web search | [console.anthropic.com](https://console.anthropic.com) → API keys |
 | `ANTHROPIC_MODEL` | *(optional)* override model | defaults to `claude-haiku-4-5-20251001` |
+| `ANTHROPIC_WEB_SEARCH` | *(optional)* set `0` to disable web search | defaults to on; web search adds a small per-search cost |
+
+> **Recency matters.** Claude's web search (same API key) is what lets the app get
+> *recent* facts right — e.g. an LLM without live search, trained before mid-2025,
+> would wrongly rate "President Buhari is dead" as false. With search on, it finds
+> the July 2025 reporting and rates it correctly, citing the sources. If web search
+> isn't enabled on your key, the app automatically falls back to model-only
+> reasoning and flags that it did.
 
 With **no** keys set the app still runs, in **offline mode** (TF-IDF model only)
 and shows a banner explaining how to enable the live sources. Everything is

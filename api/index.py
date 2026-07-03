@@ -50,6 +50,14 @@ def ngrams(text, ngram_max):
     return grams
 
 
+# The model is trained on a small (~130-example) curated corpus, so it reasons
+# from learned surface vocabulary, not real-world knowledge. To avoid confidently
+# mislabelling text it has never "seen", the demo ABSTAINS ("uncertain") when it
+# recognises too few terms or the decision is too close to the boundary.
+MIN_MATCHED_TERMS = 3      # need at least this many known n-grams to commit
+UNCERTAIN_BAND = 0.10      # |p - 0.5| below this -> uncertain
+
+
 def predict(text):
     model = load_model()
     vocab = model["vocab"]           # ngram -> [idf, coef]
@@ -70,20 +78,34 @@ def predict(text):
         score += contrib
         contributions.append((g, contrib))
 
-    prob = 1.0 / (1.0 + math.exp(-score))
-    label = 1 if prob >= 0.5 else 0
+    prob = 1.0 / (1.0 + math.exp(-score))          # raw model P(misinformation)
+    raw_label = 1 if prob >= 0.5 else 0
     contributions.sort(key=lambda kv: abs(kv[1]), reverse=True)
+
+    matched = len(vec)
+    uncertain = matched < MIN_MATCHED_TERMS or abs(prob - 0.5) < UNCERTAIN_BAND
+    if uncertain:
+        verdict = "uncertain"
+    else:
+        verdict = model["labels"][str(raw_label)]
+
     return {
-        "label": model["labels"][str(label)],
-        "label_id": label,
+        "verdict": verdict,                        # credible | misinformation | uncertain
+        "uncertain": uncertain,
+        "label": model["labels"][str(raw_label)],  # raw model call (ignoring abstention)
+        "label_id": raw_label,
         "probability_misinformation": round(prob, 4),
-        "confidence": round(prob if label == 1 else 1 - prob, 4),
+        "confidence": round(prob if raw_label == 1 else 1 - prob, 4),
+        "matched_terms": matched,
         "top_signals": [
             {"ngram": g, "weight": round(c, 4),
              "towards": "misinformation" if c > 0 else "credible"}
             for g, c in contributions[:6]
         ],
-        "matched_terms": len(vec),
+        "note": ("Too little recognised vocabulary to judge confidently — this "
+                 "demo only knows terms from its small training corpus."
+                 if uncertain else
+                 "Classified from learned vocabulary; not a real-world fact-check."),
     }
 
 
@@ -93,7 +115,7 @@ PAGE = """<!doctype html>
 <title>Nigerian Misinformation Detector</title>
 <style>
 :root{color-scheme:light dark;--bg:#0f1420;--card:#1b2333;--fg:#e8edf6;--mut:#93a1b8;
---red:#ff5c6c;--green:#31c56d;--acc:#5b8cff;--bd:#2a3549}
+--red:#ff5c6c;--green:#31c56d;--amber:#e0a338;--acc:#5b8cff;--bd:#2a3549}
 @media(prefers-color-scheme:light){:root{--bg:#f4f6fb;--card:#fff;--fg:#141a26;
 --mut:#5a667c;--bd:#e2e7f0}}
 *{box-sizing:border-box}body{margin:0;font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
@@ -119,8 +141,10 @@ padding:.25rem .7rem;cursor:pointer;background:transparent}
 .foot{color:var(--mut);font-size:.82rem;margin-top:1.4rem;text-align:center}
 </style></head><body><div class="wrap">
 <h1>Nigerian Misinformation Detector</h1>
-<p class="sub">TF-IDF + Logistic Regression, trained on a Nigerian-context fact-check corpus.
-Educational demo — not a verdict on any real claim.</p>
+<p class="sub">TF-IDF + Logistic Regression, trained on a small (~130-example) Nigerian-context
+fact-check corpus. It judges by <b>learned vocabulary</b>, not real-world knowledge,
+and says <b>“uncertain”</b> when it doesn't recognise enough of your text. Educational
+demo — not a verdict on any real claim.</p>
 <div class="card">
 <textarea id="t" placeholder="Paste a claim or social-media post, e.g. 'Drinking warm salt water flushes out coronavirus'..."></textarea>
 <div class="chips" id="ex"></div>
@@ -149,14 +173,16 @@ async function go(){
  try{
   const res=await fetch('/api/predict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});
   const d=await res.json();
-  const mis=d.label_id===1;const pct=Math.round(d.probability_misinformation*100);
+  const pct=Math.round(d.probability_misinformation*100);
+  const st=d.uncertain?{i:'🤔',c:'var(--amber)',t:'UNCERTAIN'}
+        :d.label_id===1?{i:'🚩',c:'var(--red)',t:'MISINFORMATION'}
+        :{i:'✅',c:'var(--green)',t:'CREDIBLE'};
   document.getElementById('r').style.display='block';
-  document.getElementById('v').innerHTML=(mis?'🚩 ':'✅ ')+
-   '<span style="color:'+(mis?'var(--red)':'var(--green)')+'">'+d.label.toUpperCase()+'</span>';
+  document.getElementById('v').innerHTML=st.i+' <span style=\"color:'+st.c+'\">'+st.t+'</span>';
   document.getElementById('bar').style.width=pct+'%';
-  document.getElementById('bar').style.background=mis?'var(--red)':'var(--green)';
-  document.getElementById('m').textContent='P(misinformation) = '+pct+'%  ·  confidence '+
-   Math.round(d.confidence*100)+'%  ·  '+d.matched_terms+' known terms matched';
+  document.getElementById('bar').style.background=st.c;
+  document.getElementById('m').innerHTML='P(misinformation) = '+pct+'%  ·  '+
+   d.matched_terms+' known terms matched<br><span style=\"font-size:.85em\">'+d.note+'</span>';
   let h=d.top_signals.length?'<div class="meta">Top signals</div>':'';
   d.top_signals.forEach(s=>{h+='<div class="sig"><span class="mono">'+s.ngram+
    '</span><span style="color:'+(s.weight>0?'var(--red)':'var(--green)')+'">'+
